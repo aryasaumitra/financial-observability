@@ -3,9 +3,14 @@ import hashlib
 import re
 import uuid
 import argparse
-import fitz
+import pymupdf
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient, models
+from metadata import (
+    get_or_create_company,
+    get_or_create_document,
+    insert_chunk,
+)
 
 
 # --------------------------------------------------
@@ -161,24 +166,13 @@ def make_document_id(pdf_path: Path) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Ingest a financial PDF into Qdrant"
-    )
-
-    parser.add_argument(
-        "pdf",
-        type=Path,
-        help="Path to the PDF file"
+        description="Ingest financial PDFs for a company"
     )
 
     parser.add_argument(
         "--company",
-        help="Company name, e.g. IRFC"
-    )
-
-    parser.add_argument(
-        "--financial-year",
-        type=int,
-        help="Financial year, e.g. 2025"
+        required=True,
+        help="Company ticker/folder name, e.g. irfc"
     )
 
     parser.add_argument(
@@ -189,12 +183,55 @@ def parse_args():
 
     return parser.parse_args()
 
+def find_company_pdfs(company: str, document_type: str):
+    project_root = Path(__file__).resolve().parent.parent
+
+    company_dir = project_root / "companies" / company.lower()
+
+    if document_type == "annual_report":
+        pdf_dir = company_dir / "annual-reports"
+    else:
+        raise ValueError(
+            f"Unsupported document type: {document_type}"
+        )
+
+    if not pdf_dir.exists():
+        raise FileNotFoundError(
+            f"Document directory does not exist: {pdf_dir}"
+        )
+
+    pdfs = sorted(pdf_dir.glob("*.pdf"))
+
+    if not pdfs:
+        raise FileNotFoundError(
+            f"No PDF files found in: {pdf_dir}"
+        )
+
+    return pdfs
+
+def extract_report_year(pdf_path: Path) -> int:
+    """
+    Extract report year from filename.
+
+    Example:
+        irfc-ar-2026.pdf -> 2026
+    """
+
+    match = re.search(r"(\d{4})", pdf_path.stem)
+
+    if not match:
+        raise ValueError(
+            f"Could not determine report year from filename: {pdf_path.name}"
+        )
+
+    return int(match.group(1))
+
 # --------------------------------------------------
 # EXTRACT PDF
 # --------------------------------------------------
 
 def extract_pdf(pdf_path: Path):
-    doc = fitz.open(pdf_path)
+    doc = pymupdf.open(pdf_path)
     pages = []
 
     for page_number, page in enumerate(doc, start=1):
@@ -263,34 +300,38 @@ def debug_page(page):
         print(block["text"])
 
 
-# --------------------------------------------------
-# MAIN
-# --------------------------------------------------
+def process_document(pdf_path: Path, args, company_id: int):
+    """
+    Extract and structurally chunk a single financial document.
+    """
 
-def main():
+    report_year = extract_report_year(pdf_path)
+    content_hash = make_document_id(pdf_path)
 
-    args = parse_args()
+    document_id = get_or_create_document(
+        company_id=company_id,
+        document_type=args.document_type,
+        title=f"{args.company.upper()} Annual Report {report_year}",
+        financial_year=None,
+        quarter=None,
+        document_date=None,
+        file_path=str(pdf_path),
+        page_count=None,
+        content_hash=content_hash,
+    )
 
-    pdf_path = args.pdf
-
-    print(f"Reading: {pdf_path}")
-
-    if not pdf_path.exists():
-        raise FileNotFoundError(pdf_path)
-
-
-    document_id = make_document_id(pdf_path)
-
-    print(f"Document ID: {document_id[:12]}...")
+    print()
+    print("=" * 80)
+    print(f"Processing : {pdf_path.name}")
+    print(f"Report year: {report_year}")
+    print(f"Document ID: {document_id}")
+    print("=" * 80)
 
     # ----------------------------------------------
     # Extract
     # ----------------------------------------------
 
     pages = extract_pdf(pdf_path)
-
-
-    debug_page(pages[95])
 
     print(f"Pages with text: {len(pages)}")
 
@@ -307,7 +348,6 @@ def main():
             max_words=300,
             overlap_words=50
         )
-        
 
         for chunk_index, chunk in enumerate(page_chunks):
 
@@ -316,7 +356,7 @@ def main():
 
                 "chunk_id": (
                     f"{args.company.lower()}"
-                    f"-{args.financial_year}"
+                    f"-{report_year}"
                     f"-p{page['page']}"
                     f"-c{chunk_index}"
                 ),
@@ -334,151 +374,81 @@ def main():
     print(f"Total chunks: {len(chunks)}")
 
     # ----------------------------------------------
-    # ADD DEBUG CODE HERE
+    # Store chunks in SQLite
     # ----------------------------------------------
 
-    # print()
-    # print("=" * 80)
-    # print("CHUNK SAMPLE")
-    # print("=" * 80)
+    print("Storing chunks in SQLite...")
 
-    # for chunk in chunks:
+    for sequence_number, chunk in enumerate(chunks):
 
-    #     if chunk["page_start"] == 96:
-
-    #         print()
-    #         print(
-    #             f"CHUNK {chunk['chunk_index']}"
-    #         )
-
-    #         print(
-    #             chunk["text"]
-    #         )
-
-    #         print("-" * 80)
-
-
-    # ----------------------------------------------
-    # Embedding model
-    # ----------------------------------------------
-
-    print("Loading embedding model...")
-
-    model = SentenceTransformer(
-        EMBEDDING_MODEL
-    )
-
-    print(
-        f"Embedding dimension: "
-        f"{model.get_sentence_embedding_dimension()}"
-    )
-
-    # ----------------------------------------------
-    # Generate embeddings
-    # ----------------------------------------------
-
-    texts = [
-        chunk["text"]
-        for chunk in chunks
-    ]
-
-    embeddings = model.encode(
-        texts,
-        batch_size=32,
-        show_progress_bar=True
-    )
-
-    print(
-        f"Generated embeddings: "
-        f"{embeddings.shape}"
-    )
-
-    # ----------------------------------------------
-    # Qdrant
-    # ----------------------------------------------
-
-    client = QdrantClient(
-        url="http://localhost:6333"
-    )
-
-    vector_size = embeddings.shape[1]
-
-    # Create collection if necessary
-    if not client.collection_exists(COLLECTION_NAME):
-
-        client.create_collection(
-            collection_name=COLLECTION_NAME,
-            vectors_config=models.VectorParams(
-                size=vector_size,
-                distance=models.Distance.COSINE
-            )
+        insert_chunk(
+            document_id=document_id,
+            chunk_id=chunk["chunk_id"],
+            page_start=chunk["page_start"],
+            page_end=chunk["page_end"],
+            sequence_number=sequence_number,
+            text=chunk["text"],
+            chunk_type="unknown",
         )
 
-        print(
-            f"Created collection: {COLLECTION_NAME}"
-        )
+    print(f"Stored chunks in SQLite: {len(chunks)}")
 
-    # ----------------------------------------------
-    # Upload
-    # ----------------------------------------------
+    return {
+        "document_id": document_id,
+        "report_year": report_year,
+        "content_hash": content_hash,
+        "pages": pages,
+        "chunks": chunks,
+    }
 
-    points = []
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
 
-    for chunk, embedding in zip(
-        chunks,
-        embeddings
-    ):
+def main():
 
-        # Stable UUID derived from chunk ID
-        point_id = str(
-            uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                chunk["chunk_id"]
-            )
-        )
+    args = parse_args()
 
-        points.append(
-            models.PointStruct(
-                id=point_id,
-
-                vector=embedding.tolist(),
-
-                payload={
-                    "company": args.company,
-                    "document_type": args.document_type,
-                    "financial_year": args.financial_year,
-
-                    "document_id": chunk["document_id"],
-                    "chunk_id": chunk["chunk_id"],
-
-                    "page_start": chunk["page_start"],
-                    "page_end": chunk["page_end"],
-
-                    "text": chunk["text"]
-                }
-            )
-        )
-
-    client.upsert(
-        collection_name=COLLECTION_NAME,
-        points=points,
-        wait=True
+    pdfs = find_company_pdfs(
+        args.company,
+        args.document_type
     )
 
     print()
-    print("===================================")
-    print("INGESTION COMPLETE")
-    print("===================================")
-    print(
-        f"Document : "
-        f"{args.company} "
-        f"{args.document_type} "
-        f"FY{args.financial_year}"
+    print("=" * 80)
+    print(f"Company       : {args.company}")
+    print(f"Document type : {args.document_type}")
+    print(f"PDFs found    : {len(pdfs)}")
+    print("=" * 80)
+
+    # ----------------------------------------------
+    # Company
+    # ----------------------------------------------
+
+    company_id = get_or_create_company(
+        name=args.company.upper(),
+        ticker=args.company.upper()
     )
-    print(f"Pages    : {len(pages)}")
-    print(f"Chunks   : {len(chunks)}")
-    print(f"Vectors  : {len(points)}")
-    print(f"Qdrant   : {COLLECTION_NAME}")
+
+    print(f"Company ID    : {company_id}")
+
+    # ----------------------------------------------
+    # Process documents
+    # ----------------------------------------------
+
+    for pdf_path in pdfs:
+
+        result = process_document(
+            pdf_path,
+            args,
+            company_id
+        )
+
+        print(
+            f"Completed : {pdf_path.name} "
+            f"| pages={len(result['pages'])} "
+            f"| chunks={len(result['chunks'])}"
+        )
 
 
 if __name__ == "__main__":
